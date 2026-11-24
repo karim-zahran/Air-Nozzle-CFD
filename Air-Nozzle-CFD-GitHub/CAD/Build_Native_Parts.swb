@@ -1,0 +1,118 @@
+Option Explicit
+
+' SOLIDWORKS desktop macro. API lengths are in metres.
+' Builds an editable sketch and an actual feature in each new part.
+' Existing files under CAD\Native are preserved.
+Private Const L As Double = 0.2
+Private Const Rt As Double = 0.01
+Private Const DisplayWall As Double = 0.002
+Private Const N As Long = 80
+
+Private Function WallCurve(ByVal manager As Object, ByVal offset As Double, ByVal reverse As Boolean) As Object
+    Dim xyz(0 To 242) As Double, data As Variant
+    Dim i As Long, t As Double, c As Double
+    For i = 0 To N
+        t = CDbl(i) / N
+        If reverse Then t = 1# - t
+        c = Cos(4# * Atn(1#) * t)
+        xyz(3 * i) = L * t
+        xyz(3 * i + 1) = Rt * Sqr(1# + c * c) + offset
+        xyz(3 * i + 2) = 0#
+    Next i
+    data = xyz
+    Set WallCurve = manager.CreateSpline2(data, False)
+End Function
+
+Private Function FindFeature(ByVal doc As Object, ByVal kind As String, ByVal lastMatch As Boolean) As Object
+    Dim feat As Object
+    Set feat = doc.FirstFeature
+    Do While Not feat Is Nothing
+        If feat.GetTypeName2 = kind Then
+            Set FindFeature = feat
+            If Not lastMatch Then Exit Function
+        End If
+        Set feat = feat.GetNextFeature
+    Loop
+End Function
+
+Private Sub BuildOne(ByVal app As Object, ByVal folder As String, ByVal base As String)
+    Dim doc As Object, plane As Object, sk As Object, profile As Object, axis As Object
+    Dim edge1 As Object, edge2 As Object, feature As Object, part As Object
+    Dim axisName As String, dst As String, rad As Double, ok As Boolean
+    Dim errs As Long, warnings As Long
+    Dim isShell As Boolean, isSection As Boolean
+    isShell = (base = "Air_Nozzle_3D")
+    isSection = (base = "CFD_Fluid_Section_2D")
+    dst = folder & "\" & base & ".SLDPRT"
+    If Len(Dir$(dst)) > 0 Then Exit Sub
+    Set part = app.NewPart
+    If part Is Nothing Then Err.Raise 1001, , "Select a default part template in SOLIDWORKS and run again."
+    Set doc = app.ActiveDoc
+    Set plane = FindFeature(doc, "RefPlane", False)
+    If plane Is Nothing Then Err.Raise 1002, , "The new part has no standard reference plane."
+    If Not plane.Select2(False, 0) Then Err.Raise 1003, , "Could not select the front plane."
+    Set sk = doc.SketchManager
+    sk.InsertSketch True
+    rad = Rt * Sqr(2#)
+    sk.AddToDB = True
+    If isShell Then
+        Set edge1 = WallCurve(sk, 0#, False)
+        Set edge2 = WallCurve(sk, DisplayWall, True)
+        sk.CreateLine L, rad, 0#, L, rad + DisplayWall, 0#
+        sk.CreateLine 0#, rad + DisplayWall, 0#, 0#, rad, 0#
+        Set axis = sk.CreateCenterLine(0#, 0#, 0#, L, 0#, 0#)
+        If edge2 Is Nothing Then Err.Raise 1004, , "The outer spline was not created."
+    Else
+        Set axis = sk.CreateLine(0#, 0#, 0#, L, 0#, 0#)
+        sk.CreateLine L, 0#, 0#, L, rad, 0#
+        Set edge1 = WallCurve(sk, 0#, True)
+        sk.CreateLine 0#, rad, 0#, 0#, 0#, 0#
+    End If
+    sk.AddToDB = False
+    If edge1 Is Nothing Then Err.Raise 1005, , "The bore spline was not created."
+    If axis Is Nothing Then Err.Raise 1006, , "The axis line was not created."
+    axisName = axis.GetName
+    sk.InsertSketch True
+    Set profile = FindFeature(doc, "ProfileFeature", True)
+    If profile Is Nothing Then Err.Raise 1007, , "Could not locate the completed sketch."
+    profile.Name = "Meridional_profile"
+    doc.ClearSelection2 True
+    If isSection Then
+        If Not profile.Select2(False, 4) Then Err.Raise 1008, , "Could not select the closed profile."
+        ok = doc.InsertPlanarRefSurface()
+        If Not ok Then Err.Raise 1009, , "SOLIDWORKS could not create the planar fluid face."
+    Else
+        If Not profile.Select2(False, 0) Then Err.Raise 1010, , "Could not select the revolve profile."
+        ok = doc.Extension.SelectByID2(axisName & "@" & profile.Name, "EXTSKETCHSEGMENT", 0#, 0#, 0#, True, 4, Nothing, 0)
+        If Not ok Then Err.Raise 1011, , "Could not select the sketch axis."
+        Set feature = doc.FeatureManager.FeatureRevolve2(True, True, False, False, False, False, 0, 0, 8# * Atn(1#), 0#, False, False, 0.01, 0.01, 0, 0#, 0#, True, True, True)
+        If feature Is Nothing Then Err.Raise 1012, , "SOLIDWORKS could not create the revolution."
+        feature.Name = "Revolved_profile"
+    End If
+    doc.ClearSelection2 True
+    doc.ForceRebuild3 False
+    If isSection Then
+        doc.ShowNamedView2 "", 1
+    Else
+        doc.ShowNamedView2 "", 7
+    End If
+    doc.ViewZoomtofit2
+    ok = doc.Extension.SaveAs(dst, 0, 1, Nothing, errs, warnings)
+    If (Not ok) Or errs <> 0 Then Err.Raise 1013, , "Save failed for " & base & "; SOLIDWORKS code " & CStr(errs)
+End Sub
+
+Sub main()
+    On Error GoTo Failed
+    Dim app As Object, fso As Object, folder As String
+    Set app = Application.SldWorks
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    folder = fso.BuildPath(app.GetCurrentMacroPathFolder(), "Native")
+    If Not fso.FolderExists(folder) Then fso.CreateFolder folder
+    BuildOne app, folder, "Air_Nozzle_3D"
+    BuildOne app, folder, "Air_Volume_3D"
+    BuildOne app, folder, "CFD_Fluid_Section_2D"
+    MsgBox "Native part location: " & folder, vbInformation, "Air nozzle"
+    Exit Sub
+Failed:
+    MsgBox Err.Description & vbCrLf & "The corresponding STEP part can also be opened and saved as SLDPRT.", vbExclamation, "Air nozzle"
+End Sub
